@@ -1618,7 +1618,8 @@ class GAPRefMaskPaint:
 
     After Run 1: open Mask Editor on THIS node (or its preview), paint,
     Save / «применить на изображении». Run 2 will use the painted image
-    even if upstream SAM3 rebuilds a new automatic mask.
+    even if upstream SAM3 rebuilds a new automatic mask — until you change
+    a reference image (paint auto-clears) or toggle reset.
 
     reset=True discards the paint and takes a fresh upstream mask."""
 
@@ -1679,6 +1680,13 @@ class GAPRefMaskPaint:
         last_mtime = float(state.get("ref_mask_image_mtime") or 0)
         image = str(image or "").strip()
         bg_value = float(reference_image_mask[0, 0, 0, :3].mean().item())
+        try:
+            upstream_fp = hashlib.sha1(
+                (reference_image_mask[:1, ::16, ::16, :3].detach().float().cpu()
+                 .numpy().tobytes())
+            ).hexdigest()[:12]
+        except Exception:
+            upstream_fp = "x"
         out = None
         from_paint = False
 
@@ -1686,11 +1694,29 @@ class GAPRefMaskPaint:
             state["ref_mask_painted"] = False
             state["ref_mask_image_path"] = ""
             state["ref_mask_image_mtime"] = 0
+            state["ref_mask_upstream_fp"] = upstream_fp
             _save_phase_state(state)
             out = reference_image_mask
             log.info("GAPRefMaskPaint: RESET — using fresh upstream mask %s", tuple(out.shape))
             _progress_text("REF MASK: reset to automatic", unique_id)
         else:
+            # Reference image/mask changed (new LoadImage etc.) → drop stale paint.
+            stored_fp = str(state.get("ref_mask_upstream_fp") or "")
+            if painted_flag and stored_fp and stored_fp != upstream_fp:
+                log.info(
+                    "GAPRefMaskPaint: upstream ref mask changed (%s → %s) — "
+                    "dropping sticky paint",
+                    stored_fp, upstream_fp,
+                )
+                painted_flag = False
+                state["ref_mask_painted"] = False
+                state["ref_mask_image_path"] = ""
+                state["ref_mask_image_mtime"] = 0
+                state["ref_mask_upstream_fp"] = upstream_fp
+                _save_phase_state(state)
+                last_path = ""
+                _progress_text("REF MASK: auto-reset (reference changed)", unique_id)
+
             # Reload Mask Editor file when path is new OR file was overwritten.
             img_mtime = _clipspace_mtime(image) if image else 0.0
             editor_dirty = bool(
@@ -1704,11 +1730,12 @@ class GAPRefMaskPaint:
                     state["ref_mask_painted"] = True
                     state["ref_mask_image_path"] = image
                     state["ref_mask_image_mtime"] = img_mtime
+                    state["ref_mask_upstream_fp"] = upstream_fp
                     _save_phase_state(state)
                     log.info("GAPRefMaskPaint: loaded Mask Editor image %s", tuple(out.shape))
                     _progress_text("REF MASK: from Mask Editor", unique_id)
 
-            # Sticky paint: once saved, keep it across MultiChar re-runs until reset.
+            # Sticky paint: keep across MultiChar re-runs only while upstream matches.
             if out is None and painted_flag:
                 held = _load_ref_paint()
                 if held is not None:
@@ -1723,6 +1750,8 @@ class GAPRefMaskPaint:
 
             if out is None:
                 out = reference_image_mask
+                state["ref_mask_upstream_fp"] = upstream_fp
+                _save_phase_state(state)
                 log.info("GAPRefMaskPaint: automatic upstream mask %s", tuple(out.shape))
                 _progress_text("REF MASK: automatic — paint on THIS node", unique_id)
 
@@ -1733,6 +1762,7 @@ class GAPRefMaskPaint:
 
         if from_paint:
             state["ref_mask_painted"] = True
+            state["ref_mask_upstream_fp"] = upstream_fp
             _save_phase_state(state)
         _save_ref_paint(out)
 
