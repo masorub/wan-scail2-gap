@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import time
 
 import torch
 import torch.nn.functional as F
@@ -1110,6 +1111,32 @@ def _clipspace_mtime(path_str):
     return 0.0
 
 
+def _newest_clipspace_paint():
+    """Newest Mask Editor combined save under input/clipspace (or None)."""
+    try:
+        import folder_paths
+        clip = os.path.join(folder_paths.get_input_directory(), "clipspace")
+    except Exception:
+        return None
+    if not os.path.isdir(clip):
+        return None
+    newest, best_m = None, -1.0
+    try:
+        for name in os.listdir(clip):
+            if not (name.startswith("clipspace-painted-masked-") and name.endswith(".png")):
+                continue
+            path = os.path.join(clip, name)
+            try:
+                m = os.path.getmtime(path)
+            except Exception:
+                continue
+            if m > best_m:
+                best_m, newest = m, path
+    except Exception:
+        return None
+    return newest
+
+
 def _prep_ref(image, mask, width, height, color_idx, bg_value, device):
     """Letterbox one reference image + mask to generation size; render the mask
     in the identity's palette color on the mode-appropriate background.
@@ -1642,12 +1669,6 @@ class GAPRefMaskPaint:
                     "label_off": "keep painted mask",
                     "tooltip": "Turn ON once to throw away your paint and take the new automatic mask.",
                 }),
-                # Mask Editor writes the saved clipspace path into this widget after Save
-                "image": ("STRING", {
-                    "default": "",
-                    "multiline": False,
-                    "tooltip": "Filled automatically by Mask Editor after Save — leave as is.",
-                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1657,7 +1678,7 @@ class GAPRefMaskPaint:
         }
 
     @classmethod
-    def IS_CHANGED(cls, reference_image_mask, reset=False, image="", unique_id=None,
+    def IS_CHANGED(cls, reference_image_mask, reset=False, unique_id=None,
                    prompt=None, extra_pnginfo=None):
         # MUST include upstream fingerprint — otherwise ComfyUI caches this node and
         # fresh SAM3_Detect → MultiChar masks never reach Long Video.
@@ -1670,15 +1691,22 @@ class GAPRefMaskPaint:
             finger = "x"
         paint = _ref_paint_path()
         mtime = os.path.getmtime(paint) if os.path.exists(paint) else 0
-        return f"{reset}|{image}|{mtime}|{finger}"
+        # Newest Mask Editor save in clipspace (no sticky `image` widget — that
+        # made Mask Editor reopen a stale clipspace path forever).
+        clip_m = 0.0
+        newest = _newest_clipspace_paint()
+        if newest:
+            try:
+                clip_m = os.path.getmtime(newest)
+            except Exception:
+                pass
+        return f"{reset}|{mtime}|{finger}|{clip_m}"
 
-    def hold(self, reference_image_mask, reset=False, image="", unique_id=None,
+    def hold(self, reference_image_mask, reset=False, unique_id=None,
              prompt=None, extra_pnginfo=None):
         state = _load_phase_state()
         painted_flag = bool(state.get("ref_mask_painted"))
-        last_path = str(state.get("ref_mask_image_path") or "")
-        last_mtime = float(state.get("ref_mask_image_mtime") or 0)
-        image = str(image or "").strip()
+        last_clip_mtime = float(state.get("ref_mask_clip_mtime") or 0)
         bg_value = float(reference_image_mask[0, 0, 0, :3].mean().item())
         try:
             upstream_fp = hashlib.sha1(
@@ -1692,20 +1720,19 @@ class GAPRefMaskPaint:
 
         if reset:
             state["ref_mask_painted"] = False
-            # Consume sticky path so next lines don't re-import old clipspace
-            if image:
-                state["ref_mask_image_path"] = image
-                state["ref_mask_image_mtime"] = _clipspace_mtime(image)
-            else:
-                state["ref_mask_image_path"] = ""
-                state["ref_mask_image_mtime"] = 0
+            state["ref_mask_image_path"] = ""
+            state["ref_mask_image_mtime"] = 0
+            # Ignore current clipspace until user Saves again after this reset
+            newest = _newest_clipspace_paint()
+            state["ref_mask_clip_mtime"] = (
+                os.path.getmtime(newest) if newest and os.path.isfile(newest) else time.time()
+            )
             state["ref_mask_upstream_fp"] = upstream_fp
             _save_phase_state(state)
             out = reference_image_mask
             log.info("GAPRefMaskPaint: RESET — using fresh upstream mask %s", tuple(out.shape))
             _progress_text("REF MASK: reset to automatic", unique_id)
         else:
-            # Reference image/mask changed (new LoadImage etc.) → drop stale paint.
             stored_fp = str(state.get("ref_mask_upstream_fp") or "")
             if painted_flag and stored_fp and stored_fp != upstream_fp:
                 log.info(
@@ -1715,39 +1742,36 @@ class GAPRefMaskPaint:
                 )
                 painted_flag = False
                 state["ref_mask_painted"] = False
-                # Consume sticky Mask Editor path WITHOUT reloading it — otherwise
-                # image!=last_path re-imports the OLD clipspace as "new paint".
-                if image:
-                    state["ref_mask_image_path"] = image
-                    state["ref_mask_image_mtime"] = _clipspace_mtime(image)
-                else:
-                    state["ref_mask_image_path"] = ""
-                    state["ref_mask_image_mtime"] = 0
+                newest = _newest_clipspace_paint()
+                state["ref_mask_clip_mtime"] = (
+                    os.path.getmtime(newest) if newest and os.path.isfile(newest) else time.time()
+                )
                 state["ref_mask_upstream_fp"] = upstream_fp
                 _save_phase_state(state)
-                last_path = str(state.get("ref_mask_image_path") or "")
-                last_mtime = float(state.get("ref_mask_image_mtime") or 0)
+                last_clip_mtime = float(state["ref_mask_clip_mtime"])
                 _progress_text("REF MASK: auto-reset (reference changed)", unique_id)
 
-            # Reload Mask Editor file when path is new OR file was overwritten.
-            img_mtime = _clipspace_mtime(image) if image else 0.0
-            editor_dirty = bool(
-                image and (image != last_path or img_mtime > last_mtime + 0.05)
-            )
-            if editor_dirty:
-                painted = _load_image_path(image)
-                if painted is not None:
-                    out = painted
-                    from_paint = True
-                    state["ref_mask_painted"] = True
-                    state["ref_mask_image_path"] = image
-                    state["ref_mask_image_mtime"] = img_mtime
-                    state["ref_mask_upstream_fp"] = upstream_fp
-                    _save_phase_state(state)
-                    log.info("GAPRefMaskPaint: loaded Mask Editor image %s", tuple(out.shape))
-                    _progress_text("REF MASK: from Mask Editor", unique_id)
+            # New Mask Editor Save → new/newer clipspace-painted-masked-*.png
+            newest = _newest_clipspace_paint()
+            if newest:
+                try:
+                    clip_m = float(os.path.getmtime(newest))
+                except Exception:
+                    clip_m = 0.0
+                if clip_m > last_clip_mtime + 0.05:
+                    painted = _load_image_path(newest)
+                    if painted is not None:
+                        out = painted
+                        from_paint = True
+                        state["ref_mask_painted"] = True
+                        state["ref_mask_image_path"] = newest
+                        state["ref_mask_clip_mtime"] = clip_m
+                        state["ref_mask_upstream_fp"] = upstream_fp
+                        _save_phase_state(state)
+                        log.info("GAPRefMaskPaint: loaded NEW Mask Editor save %s %s",
+                                 os.path.basename(newest), tuple(out.shape))
+                        _progress_text("REF MASK: from Mask Editor", unique_id)
 
-            # Sticky paint: keep across MultiChar re-runs only while upstream matches.
             if out is None and painted_flag:
                 held = _load_ref_paint()
                 if held is not None:
@@ -1767,7 +1791,6 @@ class GAPRefMaskPaint:
                 log.info("GAPRefMaskPaint: automatic upstream mask %s", tuple(out.shape))
                 _progress_text("REF MASK: automatic — paint on THIS node", unique_id)
 
-        # Always fit into MultiChar canvas; never drop paint for aspect mismatch.
         fitted = _fit_colored_mask(out[:1], reference_image_mask[:1], bg_value)
         n = reference_image_mask.shape[0]
         out = fitted.repeat(n, 1, 1, 1) if n > 1 else fitted
@@ -1778,12 +1801,9 @@ class GAPRefMaskPaint:
             _save_phase_state(state)
         _save_ref_paint(out)
 
-        # Mask Editor opens the sticky `image` widget path (old clipspace) instead
-        # of the node preview — keep that file in sync with what we just output.
-        try:
-            _sync_mask_editor_image(image, out)
-        except Exception as e:
-            log.warning("GAPRefMaskPaint: could not sync Mask Editor file (%s)", e)
+        # Do NOT write into sticky clipspace paths — that bumped mtime and the
+        # next queue re-imported our own sync as a "new" Mask Editor paint.
+        # Mask Editor opens node preview (ui.images); Save writes a new clipspace file.
 
         ui_images = None
         try:
