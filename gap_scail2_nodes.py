@@ -1692,8 +1692,13 @@ class GAPRefMaskPaint:
 
         if reset:
             state["ref_mask_painted"] = False
-            state["ref_mask_image_path"] = ""
-            state["ref_mask_image_mtime"] = 0
+            # Consume sticky path so next lines don't re-import old clipspace
+            if image:
+                state["ref_mask_image_path"] = image
+                state["ref_mask_image_mtime"] = _clipspace_mtime(image)
+            else:
+                state["ref_mask_image_path"] = ""
+                state["ref_mask_image_mtime"] = 0
             state["ref_mask_upstream_fp"] = upstream_fp
             _save_phase_state(state)
             out = reference_image_mask
@@ -1710,11 +1715,18 @@ class GAPRefMaskPaint:
                 )
                 painted_flag = False
                 state["ref_mask_painted"] = False
-                state["ref_mask_image_path"] = ""
-                state["ref_mask_image_mtime"] = 0
+                # Consume sticky Mask Editor path WITHOUT reloading it — otherwise
+                # image!=last_path re-imports the OLD clipspace as "new paint".
+                if image:
+                    state["ref_mask_image_path"] = image
+                    state["ref_mask_image_mtime"] = _clipspace_mtime(image)
+                else:
+                    state["ref_mask_image_path"] = ""
+                    state["ref_mask_image_mtime"] = 0
                 state["ref_mask_upstream_fp"] = upstream_fp
                 _save_phase_state(state)
-                last_path = ""
+                last_path = str(state.get("ref_mask_image_path") or "")
+                last_mtime = float(state.get("ref_mask_image_mtime") or 0)
                 _progress_text("REF MASK: auto-reset (reference changed)", unique_id)
 
             # Reload Mask Editor file when path is new OR file was overwritten.
@@ -1765,6 +1777,13 @@ class GAPRefMaskPaint:
             state["ref_mask_upstream_fp"] = upstream_fp
             _save_phase_state(state)
         _save_ref_paint(out)
+
+        # Mask Editor opens the sticky `image` widget path (old clipspace) instead
+        # of the node preview — keep that file in sync with what we just output.
+        try:
+            _sync_mask_editor_image(image, out)
+        except Exception as e:
+            log.warning("GAPRefMaskPaint: could not sync Mask Editor file (%s)", e)
 
         ui_images = None
         try:
@@ -1839,6 +1858,65 @@ def _load_image_path(path_str):
         except Exception as e:
             log.warning("GAPRefMaskPaint: failed to load %s (%s)", p, e)
     return None
+
+
+def _resolve_clipspace_write_path(path_str):
+    """Resolve Mask Editor widget path to a writable filesystem path."""
+    if not path_str or not str(path_str).strip():
+        return None
+    import folder_paths
+    raw = str(path_str).replace(" [input]", "").replace("[input]", "").strip()
+    candidates = [raw]
+    try:
+        input_dir = folder_paths.get_input_directory()
+        candidates.extend([
+            os.path.join(input_dir, raw),
+            os.path.join(input_dir, "clipspace", os.path.basename(raw)),
+        ])
+    except Exception:
+        pass
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    # Prefer creating under input/clipspace
+    try:
+        import folder_paths
+        clip = os.path.join(folder_paths.get_input_directory(), "clipspace")
+        os.makedirs(clip, exist_ok=True)
+        return os.path.join(clip, os.path.basename(raw) or "gap_ref_mask_paint_current.png")
+    except Exception:
+        return None
+
+
+def _sync_mask_editor_image(path_str, mask_bhwc):
+    """Overwrite the Mask Editor clipspace file with the current mask tensor.
+
+    ComfyUI Mask Editor prefers the sticky `image` widget path over the node
+    preview — without this sync, opening the editor shows a stale paint.
+    """
+    from PIL import Image
+    import numpy as np
+
+    path = _resolve_clipspace_write_path(path_str)
+    # Always also write a stable current file for a clean reopen
+    stable = None
+    try:
+        import folder_paths
+        clip = os.path.join(folder_paths.get_input_directory(), "clipspace")
+        os.makedirs(clip, exist_ok=True)
+        stable = os.path.join(clip, "gap_ref_mask_paint_current.png")
+    except Exception:
+        pass
+
+    img = mask_bhwc[0, ..., :3].detach().float().clamp(0, 1).cpu().numpy()
+    pil = Image.fromarray((img * 255.0).round().astype(np.uint8))
+    for dest in (path, stable):
+        if not dest:
+            continue
+        tmp = dest + ".tmp.png"
+        pil.save(tmp)
+        os.replace(tmp, dest)
+        log.info("GAPRefMaskPaint: synced Mask Editor image → %s", dest)
 
 
 NODE_CLASS_MAPPINGS = {
